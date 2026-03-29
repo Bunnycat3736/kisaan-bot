@@ -1,7 +1,7 @@
 import os
 from flask import Flask, request, Response
 from dotenv import load_dotenv
-from google import genai                     # Naya SDK
+from google import genai
 from twilio.twiml.messaging_response import MessagingResponse
 
 load_dotenv()
@@ -28,7 +28,7 @@ Rules:
 
 @app.route("/", methods=["GET"])
 def home():
-    return "✅ Kisaan Bot is running 24/7 on Render! (Fixed New SDK)"
+    return "✅ Kisaan Bot is running 24/7 on Render! (gemini-2.5-flash)"
 
 @app.route("/whatsapp", methods=["POST"])
 def whatsapp():
@@ -41,17 +41,17 @@ def whatsapp():
         try:
             full_prompt = f"{KISAAN_PROMPT}\n\nUser: {user_msg}"
             
-            # FIXED: Correct model + safe way
+            # ✅ FIXED: Latest & working model (March 2026)
             response = client.models.generate_content(
-                model="gemini-2.0-flash",          # ← Yeh ab sabse reliable hai
+                model="gemini-2.5-flash",          # ← Yeh ab best hai
                 contents=full_prompt
             )
             reply = response.text.strip()
             
-            print(f"🤖 AI Reply (first 200 chars): {reply[:200]}...")
+            print(f"🤖 AI Reply: {reply[:300]}...")   # debug ke liye
             
         except Exception as e:
-            print(f"❌ Gemini Error: {e}")      # ← Yeh Render logs mein dikhega
+            print(f"❌ Gemini Error: {e}")
             reply = "Sorry bhai, thoda issue ho gaya. Fir se batao."
 
     twiml = MessagingResponse()
