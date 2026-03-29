@@ -1,5 +1,5 @@
 flask
 twilio
 python-dotenv
-google-generativeai
+google-genai
 gunicorn
