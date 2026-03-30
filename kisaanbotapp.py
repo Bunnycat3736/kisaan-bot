@@ -1,28 +1,58 @@
 import os
-import requests
+import re
 import uuid
+import threading
+import requests
+
 from flask import Flask, request, Response, send_file
 from dotenv import load_dotenv
 from google import genai
+from google.genai import types
 from twilio.twiml.messaging_response import MessagingResponse
+from twilio.rest import Client as TwilioClient
 from gtts import gTTS
 
 load_dotenv()
 
-client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+# ---------- ENV ----------
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+TWILIO_WHATSAPP_FROM = os.getenv("TWILIO_WHATSAPP_FROM", "whatsapp:+14155238886")
+
+PUBLIC_BASE_URL = os.getenv("RENDER_EXTERNAL_URL") or (
+    f"https://{os.getenv('RENDER_EXTERNAL_HOSTNAME')}"
+    if os.getenv("RENDER_EXTERNAL_HOSTNAME")
+    else ""
+)
+
+if not GEMINI_API_KEY:
+    raise ValueError("Missing GEMINI_API_KEY in .env")
+
+if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN:
+    raise ValueError("Missing TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN in .env")
+
+# ---------- CLIENTS ----------
+gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
 app = Flask(__name__)
 
-# Memory: phone → last 5 messages
+# ---------- STORAGE ----------
 memory = {}
+VOICE_DIR = "/tmp/kisaan_voice"
+os.makedirs(VOICE_DIR, exist_ok=True)
 
 KISAAN_PROMPT = """
 You are Kisaan Bot, a helpful farming assistant for Indian farmers.
+
 Rules:
-- Give simple, clear, practical answers
-- Use easy language (Hinglish is fine)
-- Prefer low-cost, local solutions
-- Reply in same language as user
+- Give simple, clear, practical answers.
+- Use easy language (Hinglish is fine).
+- Prefer low-cost, local solutions.
+- Reply in the same language as the user.
 - Always use this exact format:
 
 1. Problem
@@ -30,12 +60,114 @@ Rules:
 3. Solution
 4. Extra Tip
 
-If user sends photo or voice note, analyse it properly and give farming advice.
+If user sends photo or voice note, analyze it properly and give farming advice.
+Keep replies short enough for WhatsApp.
 """
 
+
+# ---------- HELPERS ----------
+def clean_text(text: str) -> str:
+    text = (text or "").strip()
+    text = re.sub(r"^```(?:\w+)?\s*", "", text)
+    text = re.sub(r"\s*```$", "", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def choose_tts_lang(text: str) -> str:
+    # If Devanagari is present, use Hindi voice; otherwise English voice.
+    if re.search(r"[\u0900-\u097F]", text):
+        return "hi"
+    return "en"
+
+
+def make_speech_text(reply_text: str) -> str:
+    # Keep voice note shorter and easier to listen to.
+    text = clean_text(reply_text)
+    text = re.sub(r"\*\*", "", text)
+    text = re.sub(r"^\s*\d+\.\s*", "", text, flags=re.M)
+    return text[:500]
+
+
+def build_gemini_contents(full_prompt: str, user_msg: str, num_media: int):
+    """
+    Returns:
+      - text-only contents for normal messages
+      - multimodal contents for image/audio messages
+    """
+    if num_media <= 0:
+        return f"{full_prompt}\nUser: {user_msg}"
+
+    media_url = request.form.get("MediaUrl0")
+    content_type = request.form.get("MediaContentType0", "").strip()
+
+    if not media_url or not content_type:
+        return f"{full_prompt}\nUser: {user_msg}"
+
+    auth = (TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+    r = requests.get(media_url, auth=auth, timeout=20)
+    r.raise_for_status()
+    media_bytes = r.content
+
+    media_part = types.Part.from_bytes(
+        data=media_bytes,
+        mime_type=content_type
+    )
+
+    if "image" in content_type:
+        prompt = (
+            f"{full_prompt}\n"
+            "User sent a crop photo. Analyze the image and give farming advice."
+        )
+    elif "audio" in content_type:
+        prompt = (
+            f"{full_prompt}\n"
+            "User sent a voice note. Understand it and answer the farming problem."
+        )
+    else:
+        prompt = f"{full_prompt}\nUser: {user_msg}"
+
+    return [media_part, prompt]
+
+
+def send_voice_note_async(to_phone: str, reply_text: str):
+    try:
+        if not PUBLIC_BASE_URL:
+            print("❌ Missing RENDER_EXTERNAL_URL / RENDER_EXTERNAL_HOSTNAME")
+            return
+
+        speech_text = make_speech_text(reply_text)
+        tts_lang = choose_tts_lang(speech_text)
+
+        filename = f"voice_{uuid.uuid4().hex[:12]}.mp3"
+        filepath = os.path.join(VOICE_DIR, filename)
+
+        # Generate MP3
+        tts = gTTS(text=speech_text, lang=tts_lang, slow=False)
+        tts.save(filepath)
+
+        # Public URL Twilio can fetch
+        voice_url = f"{PUBLIC_BASE_URL}/voice/{filename}"
+
+        # Send as a separate WhatsApp media message
+        twilio_client.messages.create(
+            from_=TWILIO_WHATSAPP_FROM,
+            to=to_phone,
+            body="🎤 Kisaan Bot voice note",
+            media_url=[voice_url],
+        )
+
+        print(f"✅ Voice note sent to {to_phone}")
+
+    except Exception as e:
+        print(f"❌ Voice async error: {e}")
+
+
+# ---------- ROUTES ----------
 @app.route("/", methods=["GET"])
 def home():
-    return "✅ Kisaan Bot Pro – Image + Voice Input + Voice Reply is LIVE! 🌾"
+    return "✅ Kisaan Bot Pro – Text + Image + Voice Input + Voice Reply is LIVE! 🌾"
+
 
 @app.route("/whatsapp", methods=["POST"])
 def whatsapp():
@@ -45,83 +177,57 @@ def whatsapp():
 
     print(f"📥 From: {phone} | Text: {user_msg} | Media: {num_media}")
 
-    # Memory
     if phone not in memory:
         memory[phone] = []
-    history = "\n".join(memory[phone][-5:])
 
-    reply_text = "Sorry bhai, thoda issue ho gaya. Fir se photo/voice/text bhejo."
+    history = "\n".join(memory[phone][-5:])
+    reply_text = "Sorry bhai, thoda issue ho gaya. Fir se text/voice/photo bhejo."
 
     try:
-        full_prompt = f"{KISAAN_PROMPT}\n\nPrevious chat:\n{history}\n\n"
+        full_prompt = f"{KISAAN_PROMPT}\n\nPrevious chat:\n{history}\n"
 
-        if num_media > 0:
-            media_url = request.form.get("MediaUrl0")
-            content_type = request.form.get("MediaContentType0", "")
-            auth = (os.environ.get("TWILIO_ACCOUNT_SID"), os.environ.get("TWILIO_AUTH_TOKEN"))
-            r = requests.get(media_url, auth=auth)
-            media_bytes = r.content
+        contents = build_gemini_contents(full_prompt, user_msg, num_media)
 
-            if "image" in content_type:
-                print("🖼️ Image received")
-                full_prompt += "User sent a photo of crop/field. Analyse the image and give farming advice.\n"
-                contents = [{"role": "user", "parts": [{"text": full_prompt}, {"inline_data": {"mime_type": content_type, "data": media_bytes}}]}]
+        response = gemini_client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=contents
+        )
 
-            elif "audio" in content_type:
-                print("🎤 Voice note received")
-                full_prompt += "User sent a voice note. First transcribe it, then analyse the farming problem.\n"
-                contents = [{"role": "user", "parts": [{"text": full_prompt}, {"inline_data": {"mime_type": content_type, "data": media_bytes}}]}]
+        reply_text = clean_text(getattr(response, "text", "") or "")
+        if not reply_text:
+            reply_text = "Sorry bhai, abhi response nahi bana. Fir se try karo."
 
-            else:
-                contents = [{"role": "user", "parts": [{"text": full_prompt}]}]
-        else:
-            contents = [{"role": "user", "parts": [{"text": full_prompt + f"User: {user_msg}"}]}]
-
-        # Gemini call
-        response = client.models.generate_content(model="gemini-2.5-flash", contents=contents)
-        reply_text = response.text.strip()
-
-        # Save memory
         if user_msg:
             memory[phone].append(f"User: {user_msg}")
         memory[phone].append(f"Bot: {reply_text[:150]}...")
 
         print(f"🤖 AI Reply: {reply_text[:200]}...")
 
+        # Send voice note after the text response is already returned to Twilio.
+        threading.Thread(
+            target=send_voice_note_async,
+            args=(phone, reply_text),
+            daemon=True
+        ).start()
+
     except Exception as e:
         print(f"❌ Gemini Error: {e}")
 
-    # ================== CREATE VOICE NOTE (FREE gTTS) ==================
-    voice_url = None
-    try:
-        tts = gTTS(text=reply_text, lang='hi', slow=False)
-        filename = f"voice_{uuid.uuid4().hex[:10]}.mp3"
-        filepath = os.path.join("/tmp", filename)
-        tts.save(filepath)
-
-        # Render public URL
-        domain = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
-        voice_url = f"https://{domain}/voice/{filename}"
-    except Exception as e:
-        print(f"❌ TTS Error: {e}")
-
-    # ================== TWILIO RESPONSE ==================
+    # Immediate text reply to Twilio
     twiml = MessagingResponse()
-    msg = twiml.message(reply_text[:1500])
-    if voice_url:
-        msg.media(voice_url)
+    twiml.message(reply_text[:1500])
 
-    print("✅ Text + Voice Note sent to WhatsApp")
+    print("✅ Text reply sent to WhatsApp")
     return Response(str(twiml), mimetype="application/xml")
 
 
-# Serve voice files
-@app.route("/voice/<filename>")
+@app.route("/voice/<filename>", methods=["GET"])
 def serve_voice(filename):
-    try:
-        return send_file(os.path.join("/tmp", filename), mimetype="audio/mpeg")
-    except:
+    path = os.path.join(VOICE_DIR, filename)
+    if not os.path.exists(path):
         return "File not found", 404
+
+    return send_file(path, mimetype="audio/mpeg", as_attachment=False)
 
 
 if __name__ == "__main__":
