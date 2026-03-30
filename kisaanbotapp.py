@@ -8,9 +8,9 @@ from flask import Flask, request, Response, send_file
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
+from google.cloud import texttospeech
 from twilio.twiml.messaging_response import MessagingResponse
 from twilio.rest import Client as TwilioClient
-from gtts import gTTS
 
 load_dotenv()
 
@@ -22,10 +22,13 @@ TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_WHATSAPP_FROM = os.getenv("TWILIO_WHATSAPP_FROM", "whatsapp:+14155238886")
 
-PUBLIC_BASE_URL = os.getenv("RENDER_EXTERNAL_URL") or (
-    f"https://{os.getenv('RENDER_EXTERNAL_HOSTNAME')}"
-    if os.getenv("RENDER_EXTERNAL_HOSTNAME")
-    else ""
+PUBLIC_BASE_URL = (
+    os.getenv("RENDER_EXTERNAL_URL")
+    or (
+        f"https://{os.getenv('RENDER_EXTERNAL_HOSTNAME')}"
+        if os.getenv("RENDER_EXTERNAL_HOSTNAME")
+        else ""
+    )
 )
 
 if not GEMINI_API_KEY:
@@ -33,6 +36,12 @@ if not GEMINI_API_KEY:
 
 if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN:
     raise ValueError("Missing TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN in .env")
+
+# Google Cloud TTS uses Application Default Credentials.
+# On your laptop, run:
+#   gcloud auth application-default login
+# On Render, use a service account / ADC-compatible setup.
+tts_client = texttospeech.TextToSpeechClient()
 
 # ---------- CLIENTS ----------
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
@@ -74,26 +83,80 @@ def clean_text(text: str) -> str:
     return text.strip()
 
 
-def choose_tts_lang(text: str) -> str:
-    # If Devanagari is present, use Hindi voice; otherwise English voice.
-    if re.search(r"[\u0900-\u097F]", text):
-        return "hi"
-    return "en"
-
-
 def make_speech_text(reply_text: str) -> str:
-    # Keep voice note shorter and easier to listen to.
+    # Make the spoken audio shorter and easier to hear.
     text = clean_text(reply_text)
     text = re.sub(r"\*\*", "", text)
     text = re.sub(r"^\s*\d+\.\s*", "", text, flags=re.M)
-    return text[:500]
+    return text[:700]
+
+
+def infer_tts_language(user_msg: str, reply_text: str) -> str:
+    """
+    Simple practical voice selector:
+    - Marathi request -> mr-IN
+    - Hindi request / Devanagari with no Marathi hint -> hi-IN
+    - English request -> en-US
+    """
+    combined = f"{user_msg} {reply_text}".strip().lower()
+
+    if "marathi" in combined or "मराठी" in combined:
+        return "mr-IN"
+
+    if "english" in combined or "inglish" in combined:
+        return "en-US"
+
+    if re.search(r"[\u0900-\u097F]", combined):
+        # If Devanagari is present, use Marathi voice if the message looks Marathi-ish.
+        marathi_markers = [
+            "माझ्या", "शेतात", "उपाय", "सांगा", "पिकांना", "काय", "कसं",
+            "फवारणी", "बियाणे", "खत", "आहे", "कृपया", "मला"
+        ]
+        if any(word in combined for word in marathi_markers):
+            return "mr-IN"
+        return "hi-IN"
+
+    return "en-US"
+
+
+def tts_voice_name_for(language_code: str) -> texttospeech.VoiceSelectionParams:
+    # Let Google choose the exact voice for that language.
+    return texttospeech.VoiceSelectionParams(
+        language_code=language_code,
+        ssml_gender=texttospeech.SsmlVoiceGender.NEUTRAL,
+    )
+
+
+def synthesize_voice_mp3(text: str, language_code: str) -> str:
+    """
+    Returns local mp3 filepath.
+    """
+    filename = f"voice_{uuid.uuid4().hex[:12]}.mp3"
+    filepath = os.path.join(VOICE_DIR, filename)
+
+    synthesis_input = texttospeech.SynthesisInput(text=text)
+    voice = tts_voice_name_for(language_code)
+    audio_config = texttospeech.AudioConfig(
+        audio_encoding=texttospeech.AudioEncoding.MP3
+    )
+
+    response = tts_client.synthesize_speech(
+        input=synthesis_input,
+        voice=voice,
+        audio_config=audio_config,
+    )
+
+    with open(filepath, "wb") as out:
+        out.write(response.audio_content)
+
+    return filepath
 
 
 def build_gemini_contents(full_prompt: str, user_msg: str, num_media: int):
     """
     Returns:
-      - text-only contents for normal messages
-      - multimodal contents for image/audio messages
+      - text string for normal messages
+      - list of parts for image/audio messages
     """
     if num_media <= 0:
         return f"{full_prompt}\nUser: {user_msg}"
@@ -130,26 +193,23 @@ def build_gemini_contents(full_prompt: str, user_msg: str, num_media: int):
     return [media_part, prompt]
 
 
-def send_voice_note_async(to_phone: str, reply_text: str):
+def send_voice_note_async(to_phone: str, user_msg: str, reply_text: str):
+    """
+    Sends a separate WhatsApp voice note after the text reply is already returned.
+    """
     try:
         if not PUBLIC_BASE_URL:
             print("❌ Missing RENDER_EXTERNAL_URL / RENDER_EXTERNAL_HOSTNAME")
             return
 
         speech_text = make_speech_text(reply_text)
-        tts_lang = choose_tts_lang(speech_text)
+        lang = infer_tts_language(user_msg, reply_text)
+        mp3_path = synthesize_voice_mp3(speech_text, lang)
 
-        filename = f"voice_{uuid.uuid4().hex[:12]}.mp3"
-        filepath = os.path.join(VOICE_DIR, filename)
-
-        # Generate MP3
-        tts = gTTS(text=speech_text, lang=tts_lang, slow=False)
-        tts.save(filepath)
-
-        # Public URL Twilio can fetch
+        filename = os.path.basename(mp3_path)
         voice_url = f"{PUBLIC_BASE_URL}/voice/{filename}"
 
-        # Send as a separate WhatsApp media message
+        # Twilio WhatsApp media message
         twilio_client.messages.create(
             from_=TWILIO_WHATSAPP_FROM,
             to=to_phone,
@@ -157,7 +217,7 @@ def send_voice_note_async(to_phone: str, reply_text: str):
             media_url=[voice_url],
         )
 
-        print(f"✅ Voice note sent to {to_phone}")
+        print(f"✅ Voice note sent to {to_phone} using {lang}")
 
     except Exception as e:
         print(f"❌ Voice async error: {e}")
@@ -203,17 +263,16 @@ def whatsapp():
 
         print(f"🤖 AI Reply: {reply_text[:200]}...")
 
-        # Send voice note after the text response is already returned to Twilio.
+        # Send voice note in the background, after text reply is already returned.
         threading.Thread(
             target=send_voice_note_async,
-            args=(phone, reply_text),
+            args=(phone, user_msg, reply_text),
             daemon=True
         ).start()
 
     except Exception as e:
         print(f"❌ Gemini Error: {e}")
 
-    # Immediate text reply to Twilio
     twiml = MessagingResponse()
     twiml.message(reply_text[:1500])
 
