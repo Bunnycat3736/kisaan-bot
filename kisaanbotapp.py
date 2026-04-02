@@ -172,9 +172,9 @@ def transcribe_voice_note(media_bytes: bytes, content_type: str, filename_suffix
                 pass
 
 
-def synthesize_voice_wav(reply_text: str, user_msg: str, language_hint: str | None = None) -> str | None:
+def synthesize_voice_mp3(reply_text: str, user_msg: str, language_hint: str | None = None) -> str | None:
     """
-    Sarvam Bulbul v3 TTS -> returns local WAV filepath.
+    Sarvam Bulbul v3 TTS -> returns local MP3 filepath.
     """
     speech_text = make_speech_text(reply_text)
     if not speech_text:
@@ -184,13 +184,14 @@ def synthesize_voice_wav(reply_text: str, user_msg: str, language_hint: str | No
 
     temp_out = None
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav", dir=VOICE_DIR) as tmp:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3", dir=VOICE_DIR) as tmp:
             temp_out = tmp.name
 
         audio = sarvam_client.text_to_speech.convert(
             text=speech_text,
             model=SARVAM_TTS_MODEL,
             target_language_code=language_code,
+            output_audio_codec="mp3",
         )
 
         save(audio, temp_out)
@@ -247,12 +248,12 @@ def send_voice_note_async(to_phone: str, reply_text: str, user_msg: str, languag
             print("❌ Missing RENDER_EXTERNAL_URL / RENDER_EXTERNAL_HOSTNAME")
             return
 
-        wav_path = synthesize_voice_wav(reply_text, user_msg, language_hint)
-        if not wav_path:
+        mp3_path = synthesize_voice_mp3(reply_text, user_msg, language_hint)
+        if not mp3_path:
             print("⚠️ Voice generation failed; skipping voice note.")
             return
 
-        filename = os.path.basename(wav_path)
+        filename = os.path.basename(mp3_path)
         voice_url = f"{PUBLIC_BASE_URL}/voice/{filename}"
 
         twilio_client.messages.create(
@@ -382,7 +383,7 @@ def serve_voice(filename):
     if not os.path.exists(path):
         return "File not found", 404
 
-    return send_file(path, mimetype="audio/wav", as_attachment=False)
+    return send_file(path, mimetype="audio/mpeg", as_attachment=False)
 
 
 if __name__ == "__main__":
