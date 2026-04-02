@@ -4,5 +4,4 @@ python-dotenv
 google-genai
 gunicorn
 requests
-edge-tts
-elevenlabs
+sarvamai
