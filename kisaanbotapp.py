@@ -192,6 +192,7 @@ def synthesize_voice_mp3(reply_text: str, user_msg: str, language_hint: str | No
             model=SARVAM_TTS_MODEL,
             target_language_code=language_code,
             output_audio_codec="mp3",
+            pace=0.75,
         )
 
         save(audio, temp_out)
