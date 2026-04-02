@@ -3,7 +3,7 @@ import requests
 import uuid
 import threading
 import base64
-from flask import Flask, request, Response
+from flask import Flask, request, Response, send_file
 from dotenv import load_dotenv
 from google import genai
 from twilio.rest import Client
@@ -85,7 +85,6 @@ def whatsapp():
         response = gemini_client.models.generate_content(model="gemini-2.5-flash", contents=contents)
         reply_text = (response.text or "").strip()
 
-        # Save to memory
         if user_msg:
             memory[phone].append(f"User: {user_msg}")
         memory[phone].append(f"Bot: {reply_text[:150]}...")
@@ -95,27 +94,26 @@ def whatsapp():
     except Exception as e:
         print(f"❌ Gemini Error: {e}")
 
-    # Fast reply to WhatsApp
+    # Fast text reply
     twiml = MessagingResponse()
     twiml.message(reply_text[:1500])
 
-    # Start voice note generation in background (this is the key fix)
-    if reply_text and reply_text != "Sorry bhai, thoda issue ho gaya. Fir se text/voice/photo bhejo.":
+    # Background voice note
+    if reply_text and "Sorry bhai" not in reply_text:
         threading.Thread(target=send_voice_note, args=(phone, reply_text), daemon=True).start()
 
     print("✅ Text reply sent to WhatsApp")
     return Response(str(twiml), mimetype="application/xml")
 
 
-# ====================== BACKGROUND VOICE NOTE FUNCTION ======================
+# ====================== BACKGROUND SARVAM VOICE NOTE ======================
 def send_voice_note(phone, text):
     try:
-        # Generate voice using Sarvam AI
         audio_response = sarvam_client.text_to_speech.convert(
             text=text,
             model="bulbul:v3",
             target_language_code="hi-IN",
-            speaker="shubh"          # You can change to "ritu", "priya", "aditya" etc.
+            speaker="shubh"
         )
 
         combined_audio = "".join(audio_response.audios)
@@ -127,13 +125,11 @@ def send_voice_note(phone, text):
         with open(filepath, "wb") as f:
             f.write(audio_bytes)
 
-        # Public URL
         domain = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
         voice_url = f"https://{domain}/voice/{filename}"
 
-        # Send voice note as media message using Twilio
         twilio_client.messages.create(
-            from_=f"whatsapp:{os.environ.get('TWILIO_WHATSAPP_NUMBER')}",
+            from_=f"whatsapp:{os.environ['TWILIO_WHATSAPP_NUMBER']}",
             to=phone,
             media_url=[voice_url]
         )
