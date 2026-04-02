@@ -4,4 +4,4 @@ python-dotenv
 google-genai
 gunicorn
 requests
-sarvamai
+gtts
