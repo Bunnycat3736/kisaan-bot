@@ -100,7 +100,7 @@ def make_speech_text(reply_text: str) -> str:
     text = re.sub(r"\*\*", "", text)
     text = re.sub(r"^\s*\d+\.\s*", "", text, flags=re.M)
     text = re.sub(r"\s+", " ", text)
-    return text[:600]
+    return text[:2467]
 
 
 def infer_tts_language_code(user_msg: str, reply_text: str, language_hint: str | None = None) -> str:
