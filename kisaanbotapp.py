@@ -55,27 +55,54 @@ app = Flask(__name__)
 
 # -------------------- STORAGE --------------------
 memory = {}
+conversation_state = {}
 VOICE_DIR = "/tmp/kisaan_voice"
 os.makedirs(VOICE_DIR, exist_ok=True)
 
 KISAAN_PROMPT = """
-You are Kisaan Bot, a helpful farming assistant for Indian farmers.
+You are Kisaan Bot, a precise and practical farming assistant for Indian farmers.
+
+Your goal is not to give broad generic advice.
+Your goal is to extract the minimum important details needed to give a highly relevant, crop-specific farming answer.
 
 Rules:
-- Give simple, clear, practical answers.
-- Use easy language (Hinglish is fine).
+- Give short, clear, practical answers.
+- Use easy language.
 - Prefer low-cost, local solutions.
 - Reply in the same language as the user.
 - If the user writes in Hindi or Marathi, reply in native script, not Romanized letters.
-- Keep answers short and WhatsApp-friendly.
-- If a crop photo is sent, analyze it carefully and give practical farm advice.
-- If the user sends a voice note, understand it properly and answer the farming question.
+- Keep answers crisp and WhatsApp-friendly.
+- Ask at most 3 follow-up questions total for one issue.
+- Ask only 1 follow-up question at a time.
+- Do not ask unnecessary questions.
+- If enough details are already present, give the final answer immediately.
+- If details are missing, ask the single most important question first.
+- Never give a vague list of many possibilities unless the case is truly uncertain.
 
-Use this format when it fits:
+Before answering, check for:
+- crop name
+- symptom type
+- severity
+- timing
+- weather / season
+- watering pattern
+- pest or disease signs
+- soil or fertilizer clues
+
+If details are missing, ask a follow-up question.
+If enough info is available, answer in this format:
 1. Problem
 2. Cause
 3. Solution
 4. Extra Tip
+
+When asking a follow-up, output exactly:
+FOLLOWUP: <one short question>
+
+When giving the final answer, output exactly:
+ANSWER: <final answer>
+
+Do not output both.
 """
 
 # -------------------- HELPERS --------------------
@@ -95,21 +122,16 @@ def truncate_for_whatsapp(text: str, limit: int = 1500) -> str:
 
 
 def make_speech_text(reply_text: str) -> str:
-    # Keep voice notes shorter and easier to hear.
     text = clean_text(reply_text)
     text = re.sub(r"\*\*", "", text)
     text = re.sub(r"^\s*\d+\.\s*", "", text, flags=re.M)
+    text = re.sub(r"^FOLLOWUP:\s*", "", text, flags=re.I)
+    text = re.sub(r"^ANSWER:\s*", "", text, flags=re.I)
     text = re.sub(r"\s+", " ", text)
     return text[:2467]
 
 
 def infer_tts_language_code(user_msg: str, reply_text: str, language_hint: str | None = None) -> str:
-    """
-    Sarvam TTS language codes used here:
-    - hi-IN
-    - mr-IN
-    - en-IN
-    """
     if language_hint in {"hi-IN", "mr-IN", "en-IN"}:
         return language_hint
 
@@ -129,10 +151,33 @@ def infer_tts_language_code(user_msg: str, reply_text: str, language_hint: str |
     return "en-IN"
 
 
+def get_state(phone: str) -> dict:
+    if phone not in conversation_state:
+        conversation_state[phone] = {
+            "followup_count": 0,
+            "awaiting_clarification": False,
+        }
+    return conversation_state[phone]
+
+
+def reset_state(phone: str):
+    conversation_state[phone] = {
+        "followup_count": 0,
+        "awaiting_clarification": False,
+    }
+
+
+def split_mode_and_text(raw_text: str) -> tuple[str, str]:
+    raw_text = clean_text(raw_text)
+    match = re.match(r"^(FOLLOWUP|ANSWER)\s*:\s*(.*)$", raw_text, flags=re.I | re.S)
+    if match:
+        mode = match.group(1).upper()
+        body = clean_text(match.group(2))
+        return mode, body
+    return "ANSWER", raw_text
+
+
 def download_twilio_media(media_url: str) -> tuple[bytes, str]:
-    """
-    Returns (bytes, content_type).
-    """
     r = requests.get(
         media_url,
         auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
@@ -143,10 +188,6 @@ def download_twilio_media(media_url: str) -> tuple[bytes, str]:
 
 
 def transcribe_voice_note(media_bytes: bytes, content_type: str, filename_suffix: str) -> tuple[str, str | None]:
-    """
-    Sarvam Saaras v3 voice-note transcription.
-    Returns (transcript, detected_language_code).
-    """
     temp_in = None
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=filename_suffix, dir=VOICE_DIR) as tmp:
@@ -173,9 +214,6 @@ def transcribe_voice_note(media_bytes: bytes, content_type: str, filename_suffix
 
 
 def synthesize_voice_mp3(reply_text: str, user_msg: str, language_hint: str | None = None) -> str | None:
-    """
-    Sarvam Bulbul v3 TTS -> returns local MP3 filepath.
-    """
     speech_text = make_speech_text(reply_text)
     if not speech_text:
         return None
@@ -207,10 +245,12 @@ def synthesize_voice_mp3(reply_text: str, user_msg: str, language_hint: str | No
         return None
 
 
-def gemini_reply(full_prompt: str, user_msg: str, image_bytes: bytes | None = None, image_mime: str | None = None) -> str:
-    """
-    Gemini handles chat + image understanding.
-    """
+def gemini_reply(
+    full_prompt: str,
+    user_msg: str,
+    image_bytes: bytes | None = None,
+    image_mime: str | None = None
+) -> str:
     if image_bytes and image_mime and image_mime.startswith("image/"):
         user_prompt = (
             f"{full_prompt}\n\n"
@@ -240,10 +280,28 @@ def gemini_reply(full_prompt: str, user_msg: str, image_bytes: bytes | None = No
     return clean_text(getattr(response, "text", "") or "")
 
 
+def build_kisaan_prompt(history: str, followup_count: int, awaiting: bool, force_answer: bool = False) -> str:
+    prompt = f"""{KISAAN_PROMPT}
+
+Conversation control:
+- Follow-up questions already asked for this issue: {followup_count}/3
+- Awaiting user clarification: {"yes" if awaiting else "no"}
+
+Recent chat:
+{history}
+"""
+
+    if force_answer:
+        prompt += """
+You must now give a final answer immediately.
+Do not ask any more follow-up questions.
+Give the best practical answer possible with the available information.
+"""
+
+    return prompt
+
+
 def send_voice_note_async(to_phone: str, reply_text: str, user_msg: str, language_hint: str | None = None):
-    """
-    Sends a separate WhatsApp voice message after the text reply is already returned.
-    """
     try:
         if not PUBLIC_BASE_URL:
             print("❌ Missing RENDER_EXTERNAL_URL / RENDER_EXTERNAL_HOSTNAME")
@@ -297,9 +355,11 @@ def whatsapp():
     if phone not in memory:
         memory[phone] = []
 
+    state = get_state(phone)
     history = "\n".join(memory[phone][-5:])
     reply_text = "Sorry bhai, thoda issue ho gaya. Fir se text, voice note, ya photo bhejo."
     voice_hint = None
+    response_mode = "ANSWER"
 
     try:
         # 1) Voice note input -> Sarvam STT -> Gemini brain
@@ -332,33 +392,69 @@ def whatsapp():
 
             image_bytes, image_type = download_twilio_media(media_url)
 
-            full_prompt = f"{KISAAN_PROMPT}\n\nPrevious chat:\n{history}\n"
-            reply_text = gemini_reply(
+            full_prompt = build_kisaan_prompt(
+                history=history,
+                followup_count=state["followup_count"],
+                awaiting=state["awaiting_clarification"],
+            )
+
+            raw_reply = gemini_reply(
                 full_prompt=full_prompt,
                 user_msg=user_msg,
                 image_bytes=image_bytes,
                 image_mime=image_type or content_type,
             )
-
-        # 3) Normal text / transcription text -> Gemini text
         else:
-            full_prompt = f"{KISAAN_PROMPT}\n\nPrevious chat:\n{history}\n"
+            full_prompt = build_kisaan_prompt(
+                history=history,
+                followup_count=state["followup_count"],
+                awaiting=state["awaiting_clarification"],
+            )
+
             if not user_msg:
                 user_msg = "Hello"
 
-            reply_text = gemini_reply(
+            raw_reply = gemini_reply(
                 full_prompt=full_prompt,
                 user_msg=user_msg,
             )
 
-        reply_text = reply_text or "Sorry bhai, abhi response nahi bana. Fir se try karo."
+        if not raw_reply:
+            raise ValueError("Empty reply from Gemini")
+
+        response_mode, reply_body = split_mode_and_text(raw_reply)
+
+        # Enforce the 3-question cap
+        if response_mode == "FOLLOWUP":
+            if state["followup_count"] >= 3:
+                forced_prompt = build_kisaan_prompt(
+                    history=history,
+                    followup_count=state["followup_count"],
+                    awaiting=state["awaiting_clarification"],
+                    force_answer=True,
+                )
+                forced_raw = gemini_reply(
+                    full_prompt=forced_prompt,
+                    user_msg=user_msg,
+                )
+                _, reply_body = split_mode_and_text(forced_raw)
+                reply_text = reply_body or "Mala exact details milalya nantar me nक्की sangaen."
+                reset_state(phone)
+                response_mode = "ANSWER"
+            else:
+                reply_text = reply_body or "Need one more detail."
+                state["followup_count"] += 1
+                state["awaiting_clarification"] = True
+        else:
+            reply_text = reply_body or "Sorry bhai, abhi response nahi bana. Fir se try karo."
+            reset_state(phone)
 
         # Save memory
         if user_msg:
             memory[phone].append(f"User: {user_msg}")
         memory[phone].append(f"Bot: {reply_text[:150]}...")
 
-        print(f"🤖 AI Reply: {reply_text[:200]}...")
+        print(f"🤖 AI Reply ({response_mode}): {reply_text[:200]}...")
 
         # Voice reply comes AFTER text reply
         threading.Thread(
